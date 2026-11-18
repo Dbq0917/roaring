@@ -3,6 +3,8 @@ package roaring
 // to run just these tests: go test -run TestSetUtil*
 
 import (
+	"math/rand"
+	"sort"
 	"testing"
 )
 
@@ -107,6 +109,47 @@ func TestSetUtilIntersection2(t *testing.T) {
 	if !equal(result, expectedresult) {
 		t.Errorf("Intersection is broken")
 	}
+}
+
+func TestSetUtilAdaptiveIntersection(t *testing.T) {
+	sizes := [][2]int{
+		{0, 0}, {0, 8}, {1, 1}, {1, 2}, {1, 16}, {1, 128},
+		{2, 128}, {4, 64}, {8, 64}, {8, 256}, {16, 256},
+		{32, 512}, {64, 1024}, {128, 4096}, {4096, 4096},
+	}
+	for _, size := range sizes {
+		small := adaptiveIntersectionTestSet(size[0], int64(size[0]*1000+size[1]))
+		large := adaptiveIntersectionTestSet(size[1], int64(size[0]*1000+size[1]+1))
+		buffer := make([]uint16, size[0]+size[1])
+
+		want := localintersect2by2(small, large, buffer)
+		wantSet := append([]uint16(nil), buffer[:want]...)
+		wantCardinality := localintersect2by2Cardinality(small, large)
+		wantIntersects := len(small) != 0 && len(large) != 0 && intersects2by2Bool(small, large)
+
+		for _, sets := range [][2][]uint16{{small, large}, {large, small}} {
+			got := intersection2by2(sets[0], sets[1], buffer)
+			if !equal(buffer[:got], wantSet) {
+				t.Fatalf("intersection mismatch for sizes %dx%d", size[0], size[1])
+			}
+			if got := intersection2by2Cardinality(sets[0], sets[1]); got != wantCardinality {
+				t.Fatalf("intersection cardinality mismatch for sizes %dx%d: got %d, want %d", size[0], size[1], got, wantCardinality)
+			}
+			if got := intersects2by2(sets[0], sets[1]); got != wantIntersects {
+				t.Fatalf("intersects mismatch for sizes %dx%d: got %v, want %v", size[0], size[1], got, wantIntersects)
+			}
+		}
+	}
+}
+
+func adaptiveIntersectionTestSet(size int, seed int64) []uint16 {
+	values := rand.New(rand.NewSource(seed)).Perm(1 << 16)[:size]
+	sort.Ints(values)
+	set := make([]uint16, size)
+	for i, value := range values {
+		set[i] = uint16(value)
+	}
+	return set
 }
 
 func TestSetUtilBinarySearch(t *testing.T) {

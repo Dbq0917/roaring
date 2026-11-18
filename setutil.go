@@ -1,5 +1,7 @@
 package roaring
 
+import "math/bits"
+
 func equal(a, b []uint16) bool {
 	if len(a) != len(b) {
 		return false
@@ -247,35 +249,63 @@ func intersection2by2(
 	set2 []uint16,
 	buffer []uint16) int {
 
-	if len(set1)*64 < len(set2) {
-		return onesidedgallopingintersect2by2(set1, set2, buffer)
-	} else if len(set2)*64 < len(set1) {
-		return onesidedgallopingintersect2by2(set2, set1, buffer)
-	} else {
-		return localintersect2by2(set1, set2, buffer)
+	if len(set1) > len(set2) {
+		set1, set2 = set2, set1
 	}
+	if useGallopingIntersection(len(set1), len(set2)) {
+		return onesidedgallopingintersect2by2(set1, set2, buffer)
+	}
+	return localintersect2by2(set1, set2, buffer)
 }
 
 func intersection2by2Cardinality(
 	set1 []uint16,
 	set2 []uint16) int {
 
-	if len(set1)*64 < len(set2) {
-		return onesidedgallopingintersect2by2Cardinality(set1, set2)
-	} else if len(set2)*64 < len(set1) {
-		return onesidedgallopingintersect2by2Cardinality(set2, set1)
-	} else {
-		return localintersect2by2Cardinality(set1, set2)
+	if len(set1) > len(set2) {
+		set1, set2 = set2, set1
 	}
+	if useGallopingIntersection(len(set1), len(set2)) {
+		return onesidedgallopingintersect2by2Cardinality(set1, set2)
+	}
+	return localintersect2by2Cardinality(set1, set2)
 }
 
 func intersects2by2(
 	set1 []uint16,
 	set2 []uint16) bool {
-	// could be optimized if one set is much larger than the other one
 	if (0 == len(set1)) || (0 == len(set2)) {
 		return false
 	}
+	if len(set1) > len(set2) {
+		set1, set2 = set2, set1
+	}
+	if useGallopingIntersection(len(set1), len(set2)) {
+		return onesidedgallopingintersect2by2Bool(set1, set2)
+	}
+	return intersects2by2Bool(set1, set2)
+}
+
+// useGallopingIntersection compares a linear merge with an estimated
+// one-sided galloping search. Galloping is only selected when the smaller
+// set is sparse relative to the larger set; both costs are derived from the
+// actual cardinalities rather than a fixed size cutoff.
+func useGallopingIntersection(small, large int) bool {
+	if small == 0 || small >= large {
+		return false
+	}
+
+	// With evenly distributed values, advancing through the large set takes
+	// about log2(large/small) probes per value from the small set. Each probe
+	// has an exponential and a binary-search phase.
+	ratio := (large + small - 1) / small
+	gallopingComparisons := small * (2*bits.Len(uint(ratio)) + 4)
+	return gallopingComparisons < small+large
+}
+
+func intersects2by2Bool(
+	set1 []uint16,
+	set2 []uint16) bool {
 	k1 := 0
 	k2 := 0
 	s1 := set1[k1]
@@ -309,6 +339,36 @@ mainwhile:
 
 		} else {
 			// (set2[k2] == set1[k1])
+			return true
+		}
+	}
+	return false
+}
+
+func onesidedgallopingintersect2by2Bool(
+	smallset []uint16,
+	largeset []uint16) bool {
+
+	k1 := 0
+	k2 := 0
+	s1 := largeset[k1]
+	s2 := smallset[k2]
+mainwhile:
+	for {
+		if s1 < s2 {
+			k1 = advanceUntil(largeset, k1, len(largeset), s2)
+			if k1 == len(largeset) {
+				break mainwhile
+			}
+			s1 = largeset[k1]
+		}
+		if s2 < s1 {
+			k2++
+			if k2 == len(smallset) {
+				break mainwhile
+			}
+			s2 = smallset[k2]
+		} else {
 			return true
 		}
 	}

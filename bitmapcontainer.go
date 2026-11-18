@@ -712,8 +712,7 @@ func (bc *bitmapContainer) iandRun16(rc *runContainer16) container {
 }
 
 func (bc *bitmapContainer) iandArray(ac *arrayContainer) container {
-	acb := ac.toBitmapContainer()
-	return bc.iandBitmap(acb)
+	return bc.andArray(ac)
 }
 
 func (bc *bitmapContainer) andArray(value2 *arrayContainer) *arrayContainer {
