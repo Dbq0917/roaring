@@ -181,6 +181,11 @@ provide synchronization. Typically this is done by using channels to pass
 the *Bitmap around (in Go style; so there is only ever one owner),
 or by using `sync.Mutex` to serialize operations on Bitmaps.
 
+If readers need a stable view while another goroutine modifies a bitmap, use
+`Bitmap.Snapshot` or an iterator. Snapshots share containers with the source
+bitmap and use copy-on-write for later modifications, so creating one does not
+copy the bitmap data and iteration does not take a lock.
+
 ### Coverage
 
 We test our software. For a report on our test coverage, see

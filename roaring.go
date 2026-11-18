@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
 )
 
 // Bitmap represents a compressed bitmap where you can add integers.
 type Bitmap struct {
+	mu               sync.RWMutex
 	highlowcontainer roaringArray
 }
 
@@ -68,6 +70,8 @@ func (rb *Bitmap) WriteToMsgpack(stream io.Writer) (int64, error) {
 // implementations (Java, C) and is documented here:
 // https://github.com/RoaringBitmap/RoaringFormatSpec
 func (rb *Bitmap) ReadFrom(stream io.Reader) (int64, error) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	return rb.highlowcontainer.readFrom(stream)
 }
 
@@ -86,13 +90,16 @@ func (rb *Bitmap) ReadFrom(stream io.Reader) (int64, error) {
 // bitmap, copies of selected data (containers) are made.
 // You should *not* change the copy-on-write status of the resulting
 // bitmaps (SetCopyOnWrite).
-//
 func (rb *Bitmap) FromBuffer(buf []byte) (int64, error) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	return rb.highlowcontainer.fromBuffer(buf)
 }
 
 // RunOptimize attempts to further compress the runs of consecutive values found in the bitmap
 func (rb *Bitmap) RunOptimize() {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	rb.highlowcontainer.runOptimize()
 }
 
@@ -106,6 +113,8 @@ func (rb *Bitmap) HasRunCompression() bool {
 // expected is that written by the WriteToMsgpack()
 // call; see additional notes there.
 func (rb *Bitmap) ReadFromMsgpack(stream io.Reader) (int64, error) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	return 0, rb.highlowcontainer.readFromMsgpack(stream)
 }
 
@@ -149,18 +158,25 @@ func New() *Bitmap {
 // Clear resets the Bitmap to be logically empty, but may retain
 // some memory allocations that may speed up future operations
 func (rb *Bitmap) Clear() {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	rb.highlowcontainer.clear()
 }
 
 // ToArray creates a new slice containing all of the integers stored in the Bitmap in sorted order
 func (rb *Bitmap) ToArray() []uint32 {
-	array := make([]uint32, rb.GetCardinality())
+	snapshot := rb.snapshotArray()
+	cardinality := uint64(0)
+	for _, c := range snapshot.containers {
+		cardinality += uint64(c.getCardinality())
+	}
+	array := make([]uint32, cardinality)
 	pos := 0
 	pos2 := 0
 
-	for pos < rb.highlowcontainer.size() {
-		hs := uint32(rb.highlowcontainer.getKeyAtIndex(pos)) << 16
-		c := rb.highlowcontainer.getContainerAtIndex(pos)
+	for pos < snapshot.size() {
+		hs := uint32(snapshot.getKeyAtIndex(pos)) << 16
+		c := snapshot.getContainerAtIndex(pos)
 		pos++
 		c.fillLeastSignificant16bits(array, pos2, hs)
 		pos2 += c.getCardinality()
@@ -247,7 +263,7 @@ func (ii *intIterator) Next() uint32 {
 func newIntIterator(a *Bitmap) *intIterator {
 	p := new(intIterator)
 	p.pos = 0
-	p.highlowcontainer = &a.highlowcontainer
+	p.highlowcontainer = a.snapshotArray()
 	p.init()
 	return p
 }
@@ -285,8 +301,8 @@ func (ii *intReverseIterator) Next() uint32 {
 
 func newIntReverseIterator(a *Bitmap) *intReverseIterator {
 	p := new(intReverseIterator)
-	p.highlowcontainer = &a.highlowcontainer
-	p.pos = a.highlowcontainer.size() - 1
+	p.highlowcontainer = a.snapshotArray()
+	p.pos = p.highlowcontainer.size() - 1
 	p.init()
 	return p
 }
@@ -333,7 +349,7 @@ func (ii *manyIntIterator) NextMany(buf []uint32) int {
 func newManyIntIterator(a *Bitmap) *manyIntIterator {
 	p := new(manyIntIterator)
 	p.pos = 0
-	p.highlowcontainer = &a.highlowcontainer
+	p.highlowcontainer = a.snapshotArray()
 	p.init()
 	return p
 }
@@ -379,8 +395,26 @@ func (rb *Bitmap) ManyIterator() ManyIntIterable {
 	return newManyIntIterator(rb)
 }
 
+// Snapshot returns a lightweight, stable view of the bitmap.
+//
+// The snapshot shares the bitmap's containers until either side writes to a
+// shared container. Reads from the snapshot are therefore lock-free and are
+// not affected by later modifications to rb. Taking a snapshot itself only
+// records ownership metadata; it does not copy the bitmap data.
+func (rb *Bitmap) Snapshot() *Bitmap {
+	return &Bitmap{highlowcontainer: *rb.snapshotArray()}
+}
+
+func (rb *Bitmap) snapshotArray() *roaringArray {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return rb.highlowcontainer.snapshot()
+}
+
 // Clone creates a copy of the Bitmap
 func (rb *Bitmap) Clone() *Bitmap {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	ptr := new(Bitmap)
 	ptr.highlowcontainer = *rb.highlowcontainer.clone()
 	return ptr
@@ -459,6 +493,8 @@ func AddOffset(x *Bitmap, offset uint32) (answer *Bitmap) {
 
 // Add the integer x to the bitmap
 func (rb *Bitmap) Add(x uint32) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	hb := highbits(x)
 	ra := &rb.highlowcontainer
 	i := ra.getIndex(hb)
@@ -492,6 +528,8 @@ func (rb *Bitmap) addwithptr(x uint32) (int, container) {
 // CheckedAdd adds the integer x to the bitmap and return true  if it was added (false if the integer was already present)
 func (rb *Bitmap) CheckedAdd(x uint32) bool {
 	// TODO: add unit tests for this method
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	hb := highbits(x)
 	i := rb.highlowcontainer.getIndex(hb)
 	if i >= 0 {
@@ -514,6 +552,8 @@ func (rb *Bitmap) AddInt(x int) {
 
 // Remove the integer x from the bitmap
 func (rb *Bitmap) Remove(x uint32) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	hb := highbits(x)
 	i := rb.highlowcontainer.getIndex(hb)
 	if i >= 0 {
@@ -528,6 +568,8 @@ func (rb *Bitmap) Remove(x uint32) {
 // CheckedRemove removes the integer x from the bitmap and return true if the integer was effectively remove (and false if the integer was not present)
 func (rb *Bitmap) CheckedRemove(x uint32) bool {
 	// TODO: add unit tests for this method
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	hb := highbits(x)
 	i := rb.highlowcontainer.getIndex(hb)
 	if i >= 0 {
@@ -597,6 +639,8 @@ func (rb *Bitmap) Select(x uint32) (uint32, error) {
 
 // And computes the intersection between two bitmaps and stores the result in the current bitmap
 func (rb *Bitmap) And(x2 *Bitmap) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	pos1 := 0
 	pos2 := 0
 	intersectionsize := 0
@@ -793,6 +837,8 @@ main:
 
 // Xor computes the symmetric difference between two bitmaps and stores the result in the current bitmap
 func (rb *Bitmap) Xor(x2 *Bitmap) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	pos1 := 0
 	pos2 := 0
 	length1 := rb.highlowcontainer.size()
@@ -807,7 +853,7 @@ func (rb *Bitmap) Xor(x2 *Bitmap) {
 					break
 				}
 			} else if s1 > s2 {
-				c := x2.highlowcontainer.getWritableContainerAtIndex(pos2)
+				c := x2.highlowcontainer.getContainerAtIndex(pos2).clone()
 				rb.highlowcontainer.insertNewKeyValueAt(pos1, x2.highlowcontainer.getKeyAtIndex(pos2), c)
 				length1++
 				pos1++
@@ -835,6 +881,8 @@ func (rb *Bitmap) Xor(x2 *Bitmap) {
 
 // Or computes the union between two bitmaps and stores the result in the current bitmap
 func (rb *Bitmap) Or(x2 *Bitmap) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	pos1 := 0
 	pos2 := 0
 	length1 := rb.highlowcontainer.size()
@@ -879,6 +927,8 @@ main:
 
 // AndNot computes the difference between two bitmaps and stores the result in the current bitmap
 func (rb *Bitmap) AndNot(x2 *Bitmap) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	pos1 := 0
 	pos2 := 0
 	intersectionsize := 0
@@ -1127,6 +1177,8 @@ func (rb *Bitmap) AddMany(dat []uint32) {
 	if len(dat) == 0 {
 		return
 	}
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	prev := dat[0]
 	idx, c := rb.addwithptr(prev)
 	for _, i := range dat[1:] {
@@ -1152,6 +1204,8 @@ func BitmapOf(dat ...uint32) *Bitmap {
 // The function uses 64-bit parameters even though a Bitmap stores 32-bit values because it is allowed and meaningful to use [0,uint64(0x100000000)) as a range
 // while uint64(0x100000000) cannot be represented as a 32-bit value.
 func (rb *Bitmap) Flip(rangeStart, rangeEnd uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 
 	if rangeEnd > MaxUint32+1 {
 		panic("rangeEnd > MaxUint32+1")
@@ -1205,6 +1259,8 @@ func (rb *Bitmap) FlipInt(rangeStart, rangeEnd int) {
 // The function uses 64-bit parameters even though a Bitmap stores 32-bit values because it is allowed and meaningful to use [0,uint64(0x100000000)) as a range
 // while uint64(0x100000000) cannot be represented as a 32-bit value.
 func (rb *Bitmap) AddRange(rangeStart, rangeEnd uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	if rangeStart >= rangeEnd {
 		return
 	}
@@ -1243,6 +1299,8 @@ func (rb *Bitmap) AddRange(rangeStart, rangeEnd uint64) {
 // The function uses 64-bit parameters even though a Bitmap stores 32-bit values because it is allowed and meaningful to use [0,uint64(0x100000000)) as a range
 // while uint64(0x100000000) cannot be represented as a 32-bit value.
 func (rb *Bitmap) RemoveRange(rangeStart, rangeEnd uint64) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	if rangeStart >= rangeEnd {
 		return
 	}
@@ -1366,6 +1424,8 @@ func Flip(bm *Bitmap, rangeStart, rangeEnd uint64) *Bitmap {
 // (copy-on-write requires extra care in a threaded context).
 // Calling SetCopyOnWrite(true) on a bitmap created with FromBuffer is unsafe.
 func (rb *Bitmap) SetCopyOnWrite(val bool) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 	rb.highlowcontainer.copyOnWrite = val
 }
 

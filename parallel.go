@@ -161,12 +161,10 @@ func appenderRoutine(bitmapChan chan<- *Bitmap, resultChan <-chan keyedContainer
 		}
 	}
 	answer := &Bitmap{
-		roaringArray{
-			make([]uint16, 0, expectedKeys),
-			make([]container, 0, expectedKeys),
-			make([]bool, 0, expectedKeys),
-			false,
-			nil,
+		highlowcontainer: roaringArray{
+			keys:            make([]uint16, 0, expectedKeys),
+			containers:      make([]container, 0, expectedKeys),
+			needCopyOnWrite: make([]bool, 0, expectedKeys),
 		},
 	}
 	for i := range keys {
@@ -436,7 +434,7 @@ func ParOr(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 	}
 
 	result := Bitmap{
-		roaringArray{
+		highlowcontainer: roaringArray{
 			containers:      make([]container, containerCount),
 			keys:            make([]uint16, containerCount),
 			needCopyOnWrite: make([]bool, containerCount),

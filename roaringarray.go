@@ -104,6 +104,7 @@ type roaringArray struct {
 	containers      []container `msg:"-"` // don't try to serialize directly.
 	needCopyOnWrite []bool
 	copyOnWrite     bool
+	shared          bool
 
 	// conserz is used at serialization time
 	// to serialize containers. Otherwise empty.
@@ -122,19 +123,60 @@ func newRoaringArray() *roaringArray {
 	return &roaringArray{}
 }
 
+// snapshot creates a new view of ra without copying container data. Until one
+// side performs a structural write, both views share the same keys, containers
+// and copy-on-write flags. All containers are marked as shared so that a write
+// through either view clones the affected container first.
+func (ra *roaringArray) snapshot() *roaringArray {
+	ra.shared = true
+	sa := *ra
+	sa.conserz = nil
+	return &sa
+}
+
+// ensureWritable detaches the array metadata from any snapshots. Container
+// data remains shared until getWritableContainerAtIndex clones an individual
+// container.
+func (ra *roaringArray) ensureWritable() {
+	if !ra.shared {
+		return
+	}
+	if ra.keys != nil {
+		keys := make([]uint16, len(ra.keys))
+		copy(keys, ra.keys)
+		ra.keys = keys
+	}
+	if ra.containers != nil {
+		containers := make([]container, len(ra.containers))
+		copy(containers, ra.containers)
+		ra.containers = containers
+	}
+	if ra.needCopyOnWrite != nil {
+		needCopyOnWrite := make([]bool, len(ra.needCopyOnWrite))
+		for i := range needCopyOnWrite {
+			needCopyOnWrite[i] = true
+		}
+		ra.needCopyOnWrite = needCopyOnWrite
+	}
+	ra.shared = false
+}
+
 // runOptimize compresses the element containers to minimize space consumed.
 // Q: how does this interact with copyOnWrite and needCopyOnWrite?
 // A: since we aren't changing the logical content, just the representation,
-//    we don't bother to check the needCopyOnWrite bits. We replace
-//    (possibly all) elements of ra.containers in-place with space
-//    optimized versions.
+//
+//	we don't bother to check the needCopyOnWrite bits. We replace
+//	(possibly all) elements of ra.containers in-place with space
+//	optimized versions.
 func (ra *roaringArray) runOptimize() {
+	ra.ensureWritable()
 	for i := range ra.containers {
 		ra.containers[i] = ra.containers[i].toEfficientContainer()
 	}
 }
 
 func (ra *roaringArray) appendContainer(key uint16, value container, mustCopyOnWrite bool) {
+	ra.ensureWritable()
 	ra.keys = append(ra.keys, key)
 	ra.containers = append(ra.containers, value)
 	ra.needCopyOnWrite = append(ra.needCopyOnWrite, mustCopyOnWrite)
@@ -225,6 +267,7 @@ func (ra *roaringArray) removeIndexRange(begin, end int) {
 		return
 	}
 
+	ra.ensureWritable()
 	r := end - begin
 
 	copy(ra.keys[begin:], ra.keys[end:])
@@ -235,6 +278,7 @@ func (ra *roaringArray) removeIndexRange(begin, end int) {
 }
 
 func (ra *roaringArray) resize(newsize int) {
+	ra.ensureWritable()
 	for k := newsize; k < len(ra.containers); k++ {
 		ra.containers[k] = nil
 	}
@@ -310,7 +354,7 @@ func (ra *roaringArray) getFastContainerAtIndex(i int, needsWriteable bool) cont
 			c = t.toBitmapContainer()
 		}
 	case *bitmapContainer:
-		if needsWriteable && ra.needCopyOnWrite[i] {
+		if needsWriteable && ra.needsCopyOnWrite(i) {
 			c = ra.containers[i].clone()
 		}
 	}
@@ -318,6 +362,7 @@ func (ra *roaringArray) getFastContainerAtIndex(i int, needsWriteable bool) cont
 }
 
 func (ra *roaringArray) getWritableContainerAtIndex(i int) container {
+	ra.ensureWritable()
 	if ra.needCopyOnWrite[i] {
 		ra.containers[i] = ra.containers[i].clone()
 		ra.needCopyOnWrite[i] = false
@@ -339,6 +384,7 @@ func (ra *roaringArray) getKeyAtIndex(i int) uint16 {
 }
 
 func (ra *roaringArray) insertNewKeyValueAt(i int, key uint16, value container) {
+	ra.ensureWritable()
 	ra.keys = append(ra.keys, 0)
 	ra.containers = append(ra.containers, nil)
 
@@ -363,6 +409,7 @@ func (ra *roaringArray) remove(key uint16) bool {
 }
 
 func (ra *roaringArray) removeAtIndex(i int) {
+	ra.ensureWritable()
 	copy(ra.keys[i:], ra.keys[i+1:])
 	copy(ra.containers[i:], ra.containers[i+1:])
 
@@ -372,10 +419,12 @@ func (ra *roaringArray) removeAtIndex(i int) {
 }
 
 func (ra *roaringArray) setContainerAtIndex(i int, c container) {
+	ra.ensureWritable()
 	ra.containers[i] = c
 }
 
 func (ra *roaringArray) replaceKeyAndContainerAtIndex(i int, key uint16, c container, mustCopyOnWrite bool) {
+	ra.ensureWritable()
 	ra.keys[i] = key
 	ra.containers[i] = c
 	ra.needCopyOnWrite[i] = mustCopyOnWrite
@@ -456,9 +505,7 @@ func (ra *roaringArray) serializedSizeInBytes() uint64 {
 	return answer
 }
 
-//
 // spec: https://github.com/RoaringBitmap/RoaringFormatSpec
-//
 func (ra *roaringArray) writeTo(w io.Writer) (n int64, err error) {
 	hasRun := ra.hasRunCompression()
 	isRunSizeInBytes := 0
@@ -540,9 +587,7 @@ func (ra *roaringArray) writeTo(w io.Writer) (n int64, err error) {
 	return n, nil
 }
 
-//
 // spec: https://github.com/RoaringBitmap/RoaringFormatSpec
-//
 func (ra *roaringArray) toBytes() ([]byte, error) {
 	var buf bytes.Buffer
 	_, err := ra.writeTo(&buf)
@@ -550,6 +595,7 @@ func (ra *roaringArray) toBytes() ([]byte, error) {
 }
 
 func (ra *roaringArray) fromBuffer(buf []byte) (int64, error) {
+	ra.ensureWritable()
 	pos := 0
 	if len(buf) < 8 {
 		return 0, fmt.Errorf("buffer too small, expecting at least 8 bytes, was %d", len(buf))
@@ -653,6 +699,7 @@ func (ra *roaringArray) fromBuffer(buf []byte) (int64, error) {
 }
 
 func (ra *roaringArray) readFrom(stream io.Reader) (int64, error) {
+	ra.ensureWritable()
 	pos := 0
 	var cookie uint32
 	err := binary.Read(stream, binary.LittleEndian, &cookie)
@@ -877,15 +924,17 @@ func (ra *roaringArray) advanceUntil(min uint16, pos int) int {
 }
 
 func (ra *roaringArray) markAllAsNeedingCopyOnWrite() {
+	ra.ensureWritable()
 	for i := range ra.needCopyOnWrite {
 		ra.needCopyOnWrite[i] = true
 	}
 }
 
 func (ra *roaringArray) needsCopyOnWrite(i int) bool {
-	return ra.needCopyOnWrite[i]
+	return ra.shared || ra.needCopyOnWrite[i]
 }
 
 func (ra *roaringArray) setNeedsCopyOnWrite(i int) {
+	ra.ensureWritable()
 	ra.needCopyOnWrite[i] = true
 }
