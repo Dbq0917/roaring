@@ -96,6 +96,40 @@ func (rb *Bitmap) RunOptimize() {
 	rb.highlowcontainer.runOptimize()
 }
 
+// ReselectRepresentations re-evaluates every 65536-wide container and may
+// switch its representation (array, bitmap, or run) to the one that minimizes
+// the weighted space/query cost for the current data distribution.
+//
+// Container representations are normally chosen at write time from cardinality
+// alone (array containers hold at most 4096 values). When the distribution of
+// the stored IDs drifts later, that fixed choice leaves containers stuck in a
+// representation that is either wasteful in memory or slow to intersect. This
+// pass repairs the drift without changing the logical content of the bitmap.
+//
+// The returned ReselectionReport describes what changed. A hysteresis margin
+// prevents borderline containers from flipping back and forth as a handful of
+// values are added or removed.
+func (rb *Bitmap) ReselectRepresentations(weights WorkloadWeights) ReselectionReport {
+	return rb.highlowcontainer.reselectContainers(weights)
+}
+
+// OptimizeForSpace re-selects container representations to minimize in-memory
+// footprint only, considering the in-memory payload size of all three
+// representations (array, bitmap, run). The returned report counts converted
+// containers and reclaimed bytes.
+func (rb *Bitmap) OptimizeForSpace() ReselectionReport {
+	return rb.ReselectRepresentations(SpaceSavingWeights)
+}
+
+// OptimizeForIntersection re-selects representations favoring intersection
+// speed. Bitmap containers win for dense data because their AND cost is fixed
+// at 1024 word operations; run containers win when values cluster into long
+// consecutive intervals. Sparse containers stay as arrays because no
+// representation can beat a short sorted merge there.
+func (rb *Bitmap) OptimizeForIntersection() ReselectionReport {
+	return rb.ReselectRepresentations(IntersectionHeavyWeights)
+}
+
 // HasRunCompression returns true if the bitmap benefits from run compression
 func (rb *Bitmap) HasRunCompression() bool {
 	return rb.highlowcontainer.hasRunCompression()

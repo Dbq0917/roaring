@@ -69,6 +69,9 @@ type container interface {
 
 	numberOfRuns() int
 	toEfficientContainer() container
+	asArrayContainer() container
+	asBitmapContainer() container
+	asRunContainer16() container
 	String() string
 	containerType() contype
 }

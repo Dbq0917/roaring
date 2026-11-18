@@ -167,6 +167,34 @@ bitmaps never use more than 2 bytes per integer. You can call
 ``BoundSerializedSizeInBytes`` for a more precise estimate.
 
 
+### Re-selecting container representations
+
+Container representations are selected at write time from cardinality alone:
+array containers hold up to 4096 values, larger containers become bitmaps.
+Cardinality is a good default, but it cannot react when the data distribution
+drifts later (sparse bitmap containers loaded from disk, near-threshold array
+containers on an intersection-heavy workload, or clustered values that would
+compress into run containers). The representation is never revisited unless an
+explicit pass is requested.
+
+``ReselectRepresentations`` re-evaluates every container against a weighted
+space/intersection/scan cost model and converts only the containers whose
+win is large enough to clear a hysteresis margin, so repeated passes over
+unchanged data are stable:
+
+```go
+report := bitmap.ReselectRepresentations(roaring.IntersectionHeavyWeights)
+// report.Changed, report.ToBitmap, report.ToRun, report.SavedBytes(), ...
+
+bitmap.OptimizeForSpace()        // footprint only; finds run compression
+bitmap.OptimizeForIntersection() // favors fixed-cost bitmap/run AND kernels
+```
+
+The pass preserves the logical content of the bitmap (intersection results are
+unchanged), and each candidate's cost is derived from cardinality and run
+count without materializing it, so the scan is cheap enough to run after bulk
+ingestion or on a maintenance schedule.
+
 ### Documentation
 
 Current documentation is available at http://godoc.org/github.com/RoaringBitmap/roaring
