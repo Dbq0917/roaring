@@ -42,6 +42,13 @@ func (rb *Bitmap) FromBase64(str string) (int64, error) {
 // The format is compatible with other RoaringBitmap
 // implementations (Java, C) and is documented here:
 // https://github.com/RoaringBitmap/RoaringFormatSpec
+//
+// The stream starts with the legacy (version 1) layout described above,
+// byte-for-byte, and ends with a small version trailer (magic, format
+// version, and a length-prefixed extension area for future fields).
+// Readers that only understand the legacy format stop after the last
+// container and ignore the trailer, so the output stays readable by
+// older versions of this library.
 func (rb *Bitmap) WriteTo(stream io.Writer) (int64, error) {
 	return rb.highlowcontainer.writeTo(stream)
 }
@@ -67,8 +74,24 @@ func (rb *Bitmap) WriteToMsgpack(stream io.Writer) (int64, error) {
 // The format is compatible with other RoaringBitmap
 // implementations (Java, C) and is documented here:
 // https://github.com/RoaringBitmap/RoaringFormatSpec
+//
+// Both legacy (version 1) streams and current streams carrying a version
+// trailer are accepted. After the last container, ReadFrom attempts to
+// consume the optional trailer: on a legacy stream this finds EOF and
+// costs one extra read. Note that this means a stream must hold exactly
+// one bitmap (or be framed); concatenated bitmaps on a single stream are
+// not supported.
 func (rb *Bitmap) ReadFrom(stream io.Reader) (int64, error) {
 	return rb.highlowcontainer.readFrom(stream)
+}
+
+// FormatVersion reports the serialization format version of the data this
+// bitmap was read from: 0 for legacy data written before format versioning
+// (or for bitmaps created in memory), otherwise the version recorded in the
+// stream trailer. It can be used to tell old and new files apart during a
+// migration.
+func (rb *Bitmap) FormatVersion() int {
+	return int(rb.highlowcontainer.formatVersion)
 }
 
 // FromBuffer creates a bitmap from its serialized version stored in buffer
@@ -206,7 +229,7 @@ func BoundSerializedSizeInBytes(cardinality uint64, universeSize uint64) uint64 
 	if valsbest > valsbitmap {
 		valsbest = valsbitmap
 	}
-	return valsbest + headermax
+	return valsbest + headermax + trailerHeaderSize
 }
 
 // IntIterable allows you to iterate over the values in a Bitmap

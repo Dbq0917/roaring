@@ -40,6 +40,26 @@ This library is used in production in several systems, it is part of the [Awesom
 There are also  [Java](https://github.com/RoaringBitmap/RoaringBitmap) and [C/C++](https://github.com/RoaringBitmap/CRoaring) versions.  The Java, C, C++ and Go version are binary compatible: e.g,  you can save bitmaps
 from a Java program and load them back in Go, and vice versa. We have a [format specification](https://github.com/RoaringBitmap/RoaringFormatSpec).
 
+### Serialization format versioning
+
+Files written by `WriteTo`/`ToBytes`/`MarshalBinary` consist of the legacy
+format from the specification above, byte-for-byte, followed by a small
+version trailer (magic, format version, and a length-prefixed extension
+area for future fields). This gives both directions of compatibility:
+
+- Old readers ignore the trailer: they stop after the last container, so
+  new files remain fully readable by older versions of this library (and
+  by the Java/C implementations). Rolling back to an older binary does not
+  make newly written files unreadable.
+- New readers accept both layouts: data without a trailer is reported as
+  legacy (see `Bitmap.FormatVersion`), and trailers with a newer version
+  have their extension payload skipped by length, so future format
+  additions will not break this reader either.
+
+The trailer costs a constant 12 bytes per file regardless of bitmap size,
+and reading is unaffected: the legacy parsing path is unchanged and the
+trailer check is a single bounds check.
+
 
 This code is licensed under Apache License, Version 2.0 (ASL2.0).
 

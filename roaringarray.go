@@ -105,6 +105,12 @@ type roaringArray struct {
 	needCopyOnWrite []bool
 	copyOnWrite     bool
 
+	// formatVersion is the format version detected while reading a
+	// serialized bitmap: 0 for legacy files (no version trailer),
+	// otherwise the version recorded in the trailer. It carries no
+	// meaning for bitmaps that were built in memory.
+	formatVersion uint16
+
 	// conserz is used at serialization time
 	// to serialize containers. Otherwise empty.
 	conserz []containerSerz
@@ -254,6 +260,7 @@ func (ra *roaringArray) clone() *roaringArray {
 
 	sa := roaringArray{}
 	sa.copyOnWrite = ra.copyOnWrite
+	sa.formatVersion = ra.formatVersion
 
 	// this is where copyOnWrite is used.
 	if ra.copyOnWrite {
@@ -453,13 +460,37 @@ func (ra *roaringArray) serializedSizeInBytes() uint64 {
 	for _, c := range ra.containers {
 		answer += uint64(c.serializedSizeInBytes())
 	}
-	return answer
+	// account for the version trailer appended by writeTo
+	return answer + trailerHeaderSize
 }
 
 //
 // spec: https://github.com/RoaringBitmap/RoaringFormatSpec
 //
+// writeTo serializes the bitmap in the current format version: the legacy
+// (version 1) layout byte-for-byte, followed by a version trailer. Readers
+// that only understand the legacy format stop after the last container and
+// silently ignore the trailer, so files written here remain readable by
+// older versions of this library and by the Java/C implementations.
 func (ra *roaringArray) writeTo(w io.Writer) (n int64, err error) {
+	n, err = ra.writeToLegacy(w)
+	if err != nil {
+		return n, err
+	}
+	var trailer [trailerHeaderSize]byte
+	binary.LittleEndian.PutUint32(trailer[0:], uint32(trailerMagic))
+	binary.LittleEndian.PutUint16(trailer[4:], uint16(formatVersionCurrent))
+	// trailer[6:8] are flags, currently unused (zero)
+	// trailer[8:12] is the extension payload length, currently zero
+	written, err := w.Write(trailer[:])
+	n += int64(written)
+	return n, err
+}
+
+// writeToLegacy serializes the bitmap in the historical (version 1) format,
+// without the version trailer. The byte layout follows
+// spec: https://github.com/RoaringBitmap/RoaringFormatSpec
+func (ra *roaringArray) writeToLegacy(w io.Writer) (n int64, err error) {
 	hasRun := ra.hasRunCompression()
 	isRunSizeInBytes := 0
 	cookieSize := 8
@@ -551,6 +582,7 @@ func (ra *roaringArray) toBytes() ([]byte, error) {
 
 func (ra *roaringArray) fromBuffer(buf []byte) (int64, error) {
 	pos := 0
+	ra.formatVersion = 0
 	if len(buf) < 8 {
 		return 0, fmt.Errorf("buffer too small, expecting at least 8 bytes, was %d", len(buf))
 	}
@@ -649,11 +681,64 @@ func (ra *roaringArray) fromBuffer(buf []byte) (int64, error) {
 		}
 	}
 
+	// Detect the optional version trailer appended by current writers.
+	// Legacy buffers have no remaining bytes here and skip this entirely.
+	if len(buf)-pos >= trailerHeaderSize &&
+		binary.LittleEndian.Uint32(buf[pos:]) == trailerMagic {
+		version := binary.LittleEndian.Uint16(buf[pos+4:])
+		extLen := int(binary.LittleEndian.Uint32(buf[pos+8:]))
+		if len(buf)-pos-trailerHeaderSize < extLen {
+			return 0, fmt.Errorf("malformed bitmap, trailer extension of %d bytes overruns buffer at %d", extLen, pos)
+		}
+		// Versions newer than formatVersionCurrent are accepted: their
+		// extension payload is skipped by length, so the base data remains
+		// readable.
+		ra.formatVersion = version
+		pos += trailerHeaderSize + extLen
+	}
+
 	return int64(pos), nil
+}
+
+// readTrailer consumes the optional version trailer from stream after the
+// last container. A clean EOF (or trailing bytes that don't match the
+// trailer magic) means the stream holds a legacy version 1 bitmap; a
+// matching magic followed by a truncated header or extension is reported
+// as corruption. It returns the number of trailer bytes consumed.
+func (ra *roaringArray) readTrailer(stream io.Reader) (int, error) {
+	var hdr [trailerHeaderSize]byte
+	n, err := io.ReadFull(stream, hdr[:4])
+	if err != nil {
+		// io.EOF or io.ErrUnexpectedEOF: no trailer, legacy stream
+		return n, nil
+	}
+	if binary.LittleEndian.Uint32(hdr[:4]) != trailerMagic {
+		// not a trailer: trailing junk a legacy reader would also ignore
+		return n, nil
+	}
+	m, err := io.ReadFull(stream, hdr[4:])
+	n += m
+	if err != nil {
+		return n, fmt.Errorf("error in readTrailer: truncated trailer header: %s", err)
+	}
+	version := binary.LittleEndian.Uint16(hdr[4:])
+	extLen := int64(binary.LittleEndian.Uint32(hdr[8:]))
+	if extLen > 0 {
+		// Skip the extension payload. Unknown fields must never make the
+		// base data unreadable, regardless of their version.
+		m, err := io.CopyN(ioutil.Discard, stream, extLen)
+		n += int(m)
+		if err != nil {
+			return n, fmt.Errorf("error in readTrailer: truncated extension payload: %s", err)
+		}
+	}
+	ra.formatVersion = version
+	return n, nil
 }
 
 func (ra *roaringArray) readFrom(stream io.Reader) (int64, error) {
 	pos := 0
+	ra.formatVersion = 0
 	var cookie uint32
 	err := binary.Read(stream, binary.LittleEndian, &cookie)
 	if err != nil {
@@ -734,6 +819,13 @@ func (ra *roaringArray) readFrom(stream io.Reader) (int64, error) {
 			pos += nr
 			ra.appendContainer(keycard[2*i], nb, false)
 		}
+	}
+	// Consume the optional version trailer. Legacy files end here, in
+	// which case readTrailer is a no-op that costs a single EOF read.
+	nt, err := ra.readTrailer(stream)
+	pos += nt
+	if err != nil {
+		return int64(pos), err
 	}
 	return int64(pos), nil
 }

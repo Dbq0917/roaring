@@ -14,6 +14,22 @@ const (
 	serialCookie               = 12347 // runs, arrays, and bitmaps
 	noOffsetThreshold          = 4
 
+	// trailerMagic marks the optional version trailer that writers append
+	// after the legacy (cookie-based) format. Legacy readers stop after the
+	// last container and never see it; new readers use it to detect the
+	// format version and to skip extension payloads they don't understand.
+	// Bytes on the wire are the ASCII characters 'R','O','A','R'.
+	trailerMagic = 0x524F4152
+
+	// formatVersionCurrent is the highest format version this library writes.
+	// Version 1 is the legacy format with no trailer at all.
+	formatVersionCurrent = 2
+
+	// trailerHeaderSize is the fixed size in bytes of the version trailer:
+	// magic(4) + version(2) + flags(2) + extensionLength(4). The extension
+	// payload (currently empty) follows the header.
+	trailerHeaderSize = 12
+
 	// MaxUint32 is the largest uint32 value.
 	MaxUint32 = 4294967295
 
